@@ -1,6 +1,6 @@
 import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
 import { BrowserObservationError } from "../domain/browserObservationError.js";
-import { type BrowserObservationOperation } from "../domain/browserObservationErrors.js";
+import type { BrowserObservationOperation } from "../domain/browserObservationErrors.js";
 import { sanitizeBrowserUrl } from "../domain/browserObservation.js";
 import { createWebTextArtifact } from "../domain/webContentArtifact.js";
 
@@ -11,6 +11,10 @@ const isRecord = (value: unknown): value is UnknownRecord =>
 
 export const recordValue = (value: unknown): UnknownRecord | undefined =>
   isRecord(value) ? value : undefined;
+
+/** Preserve an omitted producer inventory as unknown rather than empty. */
+export const admitRecords = (value: unknown): readonly unknown[] | undefined =>
+  Array.isArray(value) ? value : undefined;
 
 export const recordsValue = (value: unknown): readonly UnknownRecord[] =>
   Array.isArray(value)
