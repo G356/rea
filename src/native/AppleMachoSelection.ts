@@ -1,11 +1,26 @@
 import {
+  machoDependencyCommand,
+  readMachoDylibCommandFacts,
+} from "../domain/apple/machoDylibCommand.js";
+import { readMachoSectionHeader } from "../domain/apple/machoSectionHeader.js";
+import {
+  admitMachoSegmentMapping,
+  readMachoSegmentHeader,
+} from "../domain/apple/machoSegmentHeader.js";
+import {
   MachoLoadCommandCursor,
   readMachoLoadCommandDeclarations,
 } from "../domain/apple/machoLoadCommands.js";
 import { createHash } from "node:crypto";
+import {
+  BinaryFormatFailure,
+  createFileMappingIndex,
+  type ZeroFillMapping,
+  type FileMapping,
+} from "./metadata/BinaryContainer.js";
 
 import type { FixupCommands } from "./AppleMachoFixups.js";
-import { decodeMachoName } from "./AppleMachoNames.js";
+import { decodeMachoFixedName, decodeMachoName } from "./AppleMachoNames.js";
 import {
   MACHO_ARCHITECTURE_POLICIES,
   machoSubtypeRank,
@@ -13,7 +28,7 @@ import {
 import { machoCpuSubtypeBase } from "../domain/apple/machoCpuIdentity.js";
 import {
   readFatSliceDeclarations,
-  readMachoHeaderPrefixFacts,
+  readFatHeaderPrefix,
   validateFatSlice,
   validateFatSliceIdentity,
   type FatSliceDeclaration,
@@ -65,45 +80,24 @@ export interface MachoLayout {
 
 const hex = (value: bigint) => `0x${value.toString(16)}`;
 
-/** Classify a FAT magic word; thin Mach-O returns null. */
-export const fatHeaderFormat = (
-  magic: number,
-): { readonly littleEndian: boolean; readonly fat64: boolean } | null => {
-  switch (magic) {
-    case 0xcafebabe:
-      return { littleEndian: false, fat64: false };
-    case 0xcafebabf:
-      return { littleEndian: false, fat64: true };
-    case 0xbebafeca:
-      return { littleEndian: true, fat64: false };
-    case 0xbfbafeca:
-      return { littleEndian: true, fat64: true };
-    default:
-      return null;
-  }
-};
-
 /** Select the thin Mach-O slice for `architecture` inside a FAT or thin container. */
 export const selectMachoSlice = (
   bytes: Buffer,
   architecture: string,
 ): MachoSlice => {
-  const magic = bytes.readUInt32BE(0);
-  const header = fatHeaderFormat(magic);
-  if (header === null) return { slice: 0, sliceEnd: bytes.length };
-  const { littleEndian, fat64 } = header;
-  const stride = fat64 ? 32 : 20;
-  const readUInt32 = littleEndian
-    ? (offset: number) => bytes.readUInt32LE(offset)
-    : (offset: number) => bytes.readUInt32BE(offset);
+  const header = readFatHeaderPrefix(bytes);
+  if (header.state === "unknown")
+    throw new RangeError("Truncated Mach-O header");
+  if (header.state === "not-fat") return { slice: 0, sliceEnd: bytes.length };
+  const { littleEndian, wide } = header;
   const byteOrder = littleEndian ? "little-endian" : "big-endian";
   const malformed = (reason: string) =>
     new RangeError(`${reason} (FAT header byte order: ${byteOrder})`);
   const invalid = (reason: string) =>
     new TypeError(`${reason} (FAT header byte order: ${byteOrder})`);
-  if (bytes.length < 8) throw malformed("Malformed FAT architecture table");
-  const count = readUInt32(4);
-  const headerEnd = 8 + count * stride;
+  if (header.state === "incomplete")
+    throw malformed("Malformed FAT architecture table");
+  const { count, tableEnd: headerEnd } = header;
   if (count > 128 || headerEnd > bytes.length)
     throw malformed("Malformed FAT architecture table");
   const policy = MACHO_ARCHITECTURE_POLICIES[architecture];
@@ -111,7 +105,7 @@ export const selectMachoSlice = (
     throw invalid("Requested FAT architecture is absent");
   const declarations = readFatSliceDeclarations(bytes.subarray(8, headerEnd), {
     count,
-    wide: fat64,
+    wide,
     littleEndian,
   });
   if (declarations.status !== "parsed") throw malformed(declarations.reason);
@@ -178,12 +172,7 @@ export const parseMachoLayout = (
     );
   }
   const table = declarations.value;
-  const identity = readMachoHeaderPrefixFacts(selectedBytes).identity;
-  if (identity === null)
-    throw new TypeError(
-      "Only little-endian 64-bit Mach-O metadata is supported",
-    );
-  const { cpuType, cpuSubtype } = identity;
+  const { cpuType, cpuSubtype } = table.identity;
   const fat = selection.fatDeclaration;
   if (fat !== undefined) {
     const issue = validateFatSliceIdentity(fat, {
@@ -217,6 +206,8 @@ export const parseMachoLayout = (
     slice,
     sliceEnd,
     segments: [],
+    mappings: [],
+    zeroFills: [],
     sections: [],
     dylibs: [],
     binds: [],
@@ -240,19 +231,20 @@ export const parseMachoLayout = (
   const complete = framing.finish();
   if (!complete.ok) throw new RangeError(complete.error);
   const { segments, sections, chained, binds, rebases, dylibs } = state;
+  const mappings = createFileMappingIndex(state.mappings, state.zeroFills);
   const offset = (address: bigint, size = 1): number => {
-    const matches = segments.filter(
-      (segment) =>
-        address >= segment.address &&
-        address + BigInt(size) <= segment.address + segment.size,
-    );
-    if (matches.length !== 1)
+    try {
+      return mappings.offset(address, size);
+    } catch (cause) {
+      // Metadata consumers use RangeError to retain partial facts when a
+      // pointer is unavailable. Mapping interpretation belongs to the shared
+      // image reader, including aliases that only overlap part of the span.
+      if (!(cause instanceof BinaryFormatFailure)) throw cause;
       throw new RangeError(
         `Unmapped or ambiguous metadata pointer ${hex(address)}`,
+        { cause },
       );
-    const segment = matches[0];
-    if (segment === undefined) throw new RangeError("Missing metadata segment");
-    return segment.offset + Number(address - segment.address);
+    }
   };
   return {
     segments,
@@ -281,6 +273,8 @@ interface LayoutState {
   readonly slice: number;
   readonly sliceEnd: number;
   readonly segments: Segment[];
+  readonly mappings: FileMapping[];
+  readonly zeroFills: ZeroFillMapping[];
   readonly sections: Section[];
   readonly dylibs: FixupCommands["dylibs"][number][];
   readonly binds: FixupCommands["binds"][number][];
@@ -302,33 +296,67 @@ const collectSegment = (
   { cursor, size }: LoadCommand,
   state: LayoutState,
 ): void => {
-  if (size < 72) throw new RangeError("Truncated segment command");
-  const address = bytes.readBigUInt64LE(cursor + 24),
-    fileSize = bytes.readBigUInt64LE(cursor + 48),
-    fileOffset = bytes.readBigUInt64LE(cursor + 40);
+  const parsed = readMachoSegmentHeader(
+    bytes.subarray(cursor, cursor + size),
+    true,
+    true,
+  );
+  if (!parsed.ok) throw new RangeError("Truncated segment command");
+  const {
+    address,
+    memorySize,
+    nameBytes,
+    fileSize,
+    fileOffset,
+    protection,
+    sectionCount: count,
+    headerSize,
+  } = parsed.value;
+  const admitted = admitMachoSegmentMapping(parsed.value, 64);
+  if (!admitted.ok) throw new RangeError(admitted.error.message);
   if (fileOffset + fileSize > BigInt(state.sliceEnd - state.slice))
     throw new RangeError("Segment file range exceeds target bytes");
+  const name = decodeMachoFixedName(nameBytes);
   state.segments.push({
     address,
     size: fileSize,
     offset: state.slice + Number(fileOffset),
-    executable: (bytes.readUInt32LE(cursor + 60) & 4) !== 0,
+    executable: (protection & 4) !== 0,
   });
-  if (fileOffset === 0n && fileSize > 0n) state.baseAddress ??= address;
-  const count = bytes.readUInt32LE(cursor + 64);
-  if (72 + count * 80 > size) throw new RangeError("Truncated section table");
+  if (!admitted.value.unmapped && name !== "__PAGEZERO")
+    state.mappings.push({
+      address,
+      size: Number(fileSize),
+      offset: state.slice + Number(fileOffset),
+    });
+  if (memorySize > fileSize && name !== "__PAGEZERO")
+    state.zeroFills.push({
+      address: address + fileSize,
+      size: memorySize - fileSize,
+    });
+  if (
+    !admitted.value.unmapped &&
+    name !== "__PAGEZERO" &&
+    fileOffset === 0n &&
+    fileSize > 0n
+  )
+    state.baseAddress ??= address;
+  if (headerSize + count * 80 > size)
+    throw new RangeError("Truncated section table");
   for (let section = 0; section < count; section++) {
-    const position = cursor + 72 + section * 80;
-    const sectionSize = bytes.readBigUInt64LE(position + 40);
+    const position = cursor + headerSize + section * 80;
+    const parsedSection = readMachoSectionHeader(
+      bytes.subarray(position, position + 80),
+      true,
+      true,
+    );
+    if (!parsedSection.ok) throw new RangeError("Truncated section table");
+    const { nameBytes, address, size: sectionSize } = parsedSection.value;
     if (sectionSize > BigInt(Number.MAX_SAFE_INTEGER))
       throw new RangeError("Section size exceeds exact numeric range");
     state.sections.push({
-      name: bytes
-        .subarray(position, position + 16)
-        // ASCII decoding masks high bits and can fabricate known metadata names.
-        .toString("latin1")
-        .replace(/\0.*$/u, ""),
-      address: bytes.readBigUInt64LE(position + 32),
+      name: decodeMachoFixedName(nameBytes),
+      address,
       size: Number(sectionSize),
     });
   }
@@ -337,9 +365,6 @@ const collectSegment = (
 const LC_DYLD_INFO = 0x22;
 const LC_DYLD_INFO_ONLY = 0x80000022;
 const LC_DYLD_CHAINED_FIXUPS = 0x80000034;
-const DYLIB_COMMANDS: readonly number[] = [
-  0xc, 0x80000018, 0x8000001f, 0x20, 0x80000023,
-];
 
 /** Record fixup data ranges and dylib install names from one load command. */
 const collectFixupCommand = (
@@ -369,16 +394,27 @@ const collectFixupCommand = (
       const bound = range(at);
       if (bound.size > 0) state.binds.push({ ...bound, stream });
     }
-  } else if (DYLIB_COMMANDS.includes(kind)) {
-    if (size < 24) throw new RangeError("Truncated dylib command");
-    const nameOffset = bytes.readUInt32LE(cursor + 8);
-    if (nameOffset < 24 || nameOffset >= size)
+  } else if (machoDependencyCommand(kind) !== null) {
+    const parsed = readMachoDylibCommandFacts(
+      bytes.subarray(cursor, cursor + size),
+      true,
+    );
+    if (!parsed.ok) {
+      if (parsed.error._tag === "InvalidMachoDylibCommand")
+        throw new RangeError("Truncated dylib command");
+      if (parsed.error.reason === "unterminated")
+        throw new RangeError("Unterminated dylib install name");
       throw new RangeError("Dylib install name is outside its load command");
-    const end = bytes.indexOf(0, cursor + nameOffset);
-    if (end < 0 || end >= cursor + size)
-      throw new RangeError("Unterminated dylib install name");
+    }
+    const { nameBytes } = parsed.value;
     state.dylibs.push(
-      decodeMachoName(bytes.subarray(cursor + nameOffset, end)),
+      decodeMachoName(
+        Buffer.from(
+          nameBytes.buffer,
+          nameBytes.byteOffset,
+          nameBytes.byteLength,
+        ),
+      ),
     );
   }
 };

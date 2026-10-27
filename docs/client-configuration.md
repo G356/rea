@@ -74,6 +74,17 @@ Connect Fiddler Everywhere's MCP server separately for HTTP traffic debugging,
 preserving your REA client entry. See the
 [setup instructions and public skills](web-network-captures.md#fiddler-everywhere-mcp-and-public-skills).
 
+## VS Code
+
+`rea setup --client vscode` configures the default VS Code user profile's
+`mcp.json`. Setup honors `VSCODE_PORTABLE` and `VSCODE_APPDATA` when they are
+present in its environment. It cannot infer a running window's named profile
+or `--user-data-dir`; configure that profile separately when needed.
+
+`rea setup --client copilot_cli` instead configures Copilot's user
+`mcp-config.json`. VS Code can forward eligible profile servers to Copilot
+sessions; see the [VS Code MCP configuration reference](https://code.visualstudio.com/docs/agents/reference/mcp-configuration).
+
 ## GitHub Copilot CLI
 
 Setup preserves an existing `tools` selection in the REA registration, including
@@ -204,14 +215,25 @@ and Claude Code reports that autocompact is thrashing. To avoid this:
   `mcpServers.rea` entry in `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json`
   when that variable is set), then restart Claude Code. Setup keeps this
   override.
+- To remove entire tool families from the upfront catalog, run
+  `rea setup --client claude_code --tool-families <ids>` with the families the
+  workflow needs (see [the advertising scope contract](mcp-contracts.md#tool-family-advertising-scope)).
+  Out-of-scope tools are not advertised and their calls fail with the SDK's
+  disabled-tool error, so widen the selection when a task needs another
+  family. Setup writes the scope into the entry's `env` as
+  `REA_MCP_TOOL_FAMILIES`; rerun setup with a different selection to refresh
+  it, then restart Claude Code.
 
 The sizes above come from REA's own `tools/list`. A live Claude Code session
 against DeepSeek's API is unverified.
 
-For a client whose stdio reader rejects the complete catalog frame, add
-`"REA_MCP_OUTPUT_SCHEMA_PROFILE": "off"` to REA's `env` object and restart the
-client. This omits only advertised output schemas; REA still validates complete
-structured results against its canonical contracts. See [MCP output schema
+For a client whose stdio reader rejects the complete catalog frame, set
+`"REA_MCP_OUTPUT_SCHEMA_PROFILE": "compact"` to bound every advertised output
+schema, or `"off"` to omit them, in REA's `env` object, then restart the client.
+Both keep canonical result validation and complete structured results; `compact`
+keeps a widened root shape and `off` advertises nothing. On catalogs large
+enough that full input schemas alone approach the frame limit, also keep the
+input profile at its `compact` default. See [MCP output schema
 profiles](mcp-contracts.md#output-schemas).
 
 ## Kimi Code
@@ -502,10 +524,12 @@ installs its skill copy there.
 ## Factory Droid
 
 For [Factory Droid](https://docs.factory.com/harness/mcp), setup writes
-`mcpServers.rea` into the user-level `~/.factory/mcp.json`. Entries carry
-`command`, `args`, and `env`. Droid discovers personal skills from
-`~/.factory/skills` ([skills](https://docs.factory.com/harness/skills)), so
-setup installs its skill copy there.
+`mcpServers.rea` into the user-level `~/.factory/mcp.json` (the
+`FACTORY_HOME_OVERRIDE` override replaces the home that contains `.factory`).
+Entries carry `command`, `args`, and `env`. Droid discovers personal skills
+from `~/.factory/skills` ([skills](https://docs.factory.com/harness/skills),
+following `FACTORY_HOME_OVERRIDE` when set), so setup installs its skill copy
+there.
 
 ## Trae
 
@@ -648,8 +672,10 @@ become active again. Malformed applicable files block setup before changes.
 Grok Build loads `[mcp_servers.rea]` from `$GROK_HOME/config.toml`, or from
 `~/.grok/config.toml` when `GROK_HOME` is unset or empty. Setup edits that server
 table, `[mcp_servers.rea.env]`, and a root `disabled_mcp_servers` entry that
-names `rea`. It sets `startup_timeout_sec = 30` and leaves every other name
-in that list. The shared skill installed under `~/.agents/skills` is already
+names `rea`. It defaults `startup_timeout_sec` to 30 seconds, preserves an
+existing positive timeout, and leaves every other name in that list.
+[Grok supports longer startup timeouts](https://docs.x.ai/build/features/mcp-servers)
+for cold package-runner launches. The shared skill installed under `~/.agents/skills` is already
 on Grok Build's skill path.
 
 Grok Bot (`grok_bot`) is detected from `~/.grokbot`, or from `SAND_DATA_ROOT`

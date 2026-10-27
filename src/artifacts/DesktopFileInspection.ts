@@ -1,8 +1,10 @@
+import { observeMzWindowsHeader } from "../domain/dosMz.js";
 import { readPeCoffHeader } from "../domain/peCoffHeader.js";
 import {
   hasGodotPckHeader,
   readGodotPckHeaderFacts,
 } from "../domain/godotPckFormat.js";
+import { observeEmbeddedGodotPck } from "./GodotPckLocation.js";
 import type { FileHandle } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { setImmediate } from "node:timers/promises";
@@ -14,11 +16,12 @@ import {
   peRvaToFileOffset,
 } from "../domain/binaryTarget.js";
 import { readManagedMetadataLayout } from "../dotnet/ManagedMetadataLayout.js";
+import { readManagedCliHeaderPrefix } from "../domain/managed/managedCliHeaderPrefix.js";
 import { readAssemblyReferenceName } from "../dotnet/ManagedMetadataInventoryRows.js";
 import { ManagedReaderFailure } from "../dotnet/ManagedReaderFailure.js";
 import { ArtifactReaderFailure } from "./ArtifactReader.js";
 import { abortIfNeeded } from "./ArtifactHash.js";
-import { hasMachoMagic } from "./apple/MachoLoadCommandReader.js";
+import { hasMachoMagic } from "../domain/apple/machoContainer.js";
 
 export interface DesktopReadBudget {
   bytes: number;
@@ -189,7 +192,15 @@ export const inspectDesktopFile = async (
   };
   if (prefix.length === 64 && prefix.readUInt16LE(0) === 0x5a4d)
     await observe(() =>
-      inspectPeFile(prefix, row, read, fact, unityManagedDirectory, signal),
+      inspectPeFile(
+        prefix,
+        size,
+        row,
+        read,
+        fact,
+        unityManagedDirectory,
+        signal,
+      ),
     );
   if (
     (native || (prefix.length >= 2 && prefix.readUInt16LE(0) === 0x5a4d)) &&
@@ -203,15 +214,31 @@ type RecordDesktopFact = (observation: DesktopFact) => void;
 
 const inspectPeFile = async (
   prefix: Buffer,
+  size: number,
   row: DesktopFile,
   read: DesktopByteRead,
   fact: RecordDesktopFact,
   unityManagedDirectory: string | null,
   signal?: AbortSignal,
 ): Promise<void> => {
-  const peOffset = prefix.readUInt32LE(0x3c);
-  const coff = await read(peOffset, 24);
-  if (coff.toString("latin1", 0, 4) !== "PE\0\0") return;
+  const observed = observeMzWindowsHeader(prefix, size);
+  if (observed.state === "candidate") {
+    row.issues.push("MZ Windows new-header candidate is unresolved");
+    return;
+  }
+  if (observed.state !== "signature-needed" && observed.state !== "declared")
+    return;
+  const peOffset = observed.offset;
+  // The MZ pointer requests signature evidence, not a PE/COFF extent. Preserve
+  // short NE/LE/LX signatures and let the COFF owner diagnose truncated PE.
+  const coff = await read(peOffset, Math.min(24, size - peOffset));
+  const confirmed = observeMzWindowsHeader(prefix, size, {
+    offset: peOffset,
+    bytes: coff,
+  });
+  if (confirmed.state === "candidate")
+    row.issues.push("MZ Windows new-header candidate is unresolved");
+  if (confirmed.state !== "declared" || confirmed.signature !== "PE") return;
   const header = readPeCoffHeader(coff.subarray(4));
   if (!header.ok) {
     row.issues.push(header.error.message);
@@ -261,14 +288,14 @@ const inspectPeFile = async (
       "format",
       "CLI metadata directory cannot be mapped",
     );
-  const cli = await read(cliOffset, 16);
-  if (cli.readUInt32LE(0) < 72)
+  const cli = readManagedCliHeaderPrefix(await read(cliOffset, 16));
+  if (!cli.ok || cli.value.headerSize < 72)
     throw new ArtifactReaderFailure(
       "format",
       "CLI header declares a truncated runtime header",
     );
-  const metadataBytes = cli.readUInt32LE(12);
-  const metadataOffset = mapped(cli.readUInt32LE(8), metadataBytes);
+  const metadataBytes = cli.value.metadata.size;
+  const metadataOffset = mapped(cli.value.metadata.rva, metadataBytes);
   if (metadataOffset === undefined)
     throw new ArtifactReaderFailure(
       "format",
@@ -326,22 +353,20 @@ const inspectPckTrailer = async (
   read: DesktopByteRead,
   fact: RecordDesktopFact,
 ): Promise<void> => {
-  const trailer = await read(size - 12, 12);
-  if (trailer.toString("latin1", 8, 12) === "GDPC") {
-    const packSize = trailer.readBigUInt64LE(0);
-    if (packSize < 20n || packSize > BigInt(size - 12))
-      throw new ArtifactReaderFailure(
-        "format",
-        "Embedded PCK trailer declares an invalid pack extent",
-      );
-    const offset = size - 12 - Number(packSize);
-    const bytes = await read(offset, 20);
-    if (!hasGodotPckHeader(bytes))
-      throw new ArtifactReaderFailure(
-        "format",
-        "Embedded PCK trailer does not locate a pack header",
-      );
-    const header = readGodotPckHeaderFacts(bytes);
+  const observation = await observeEmbeddedGodotPck(size, 20, read);
+  if (observation.state === "invalid-extent")
+    throw new ArtifactReaderFailure(
+      "format",
+      "Embedded PCK trailer declares an invalid pack extent",
+    );
+  if (observation.state === "header-mismatch")
+    throw new ArtifactReaderFailure(
+      "format",
+      "Embedded PCK trailer does not locate a pack header",
+    );
+  if (observation.state === "located") {
+    const offset = observation.start;
+    const header = readGodotPckHeaderFacts(observation.header);
     fact({
       kind: "godot-pck-header",
       offset,

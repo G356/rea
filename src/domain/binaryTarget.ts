@@ -4,8 +4,6 @@ import type {
   HeaderArchitecture,
   MipsElfMetadata,
   PeCodeViewRecord,
-  RiscvElfMetadata,
-  PowerPcElfMetadata,
   UniversalMachOSlice,
 } from "./binaryTargetTypes.js";
 import { err, ok, type Result } from "./result.js";
@@ -20,11 +18,12 @@ import { readElfFixedHeader } from "./elfFixedHeader.js";
 import {
   mzWindowsHeaderLayoutLimitation,
   parseMzHeaderEvidence,
+  type MzHeaderEvidence,
   type MzWindowsHeaderSignatureEvidence,
 } from "./dosMz.js";
 import { decodePeMachine, readPeOptionalHeader } from "./peMachine.js";
 import {
-  classifyFatContainerIdentity,
+  classifyFatContainerEvidence,
   readFatContainerHeader,
   readMachoHeaderPrefixFacts,
   validateFatSliceIdentity,
@@ -47,13 +46,13 @@ export type ExecutableMetadata =
       readonly format: "elf";
       readonly architecture: "riscv";
       readonly availableArchitectures: readonly "riscv"[];
-      readonly riscv: RiscvElfMetadata;
+      readonly riscv: ElfFamilyMetadata;
     }
   | {
       readonly format: "elf";
       readonly architecture: "powerpc";
       readonly availableArchitectures: readonly "powerpc"[];
-      readonly powerpc: PowerPcElfMetadata;
+      readonly powerpc: ElfFamilyMetadata;
     }
   | {
       readonly format: "elf";
@@ -102,9 +101,7 @@ export const claimsExecutableHeader = (
 ): boolean =>
   (bytes.length >= 4 &&
     (bytes.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46])) ||
-      [0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe].includes(
-        bytes.readUInt32BE(0),
-      ))) ||
+      readMachoHeaderPrefixFacts(bytes).format !== null)) ||
   (bytes.length >= 2 && bytes[0] === 0x4d && bytes[1] === 0x5a) ||
   readFatContainerHeader(bytes, fileSize).state !== "not-fat";
 
@@ -126,10 +123,12 @@ export const parseExecutableHeader = (
   )
     return parseElf(bytes, fileSize);
   if (bytes.length >= 2 && bytes[0] === 0x4d && bytes[1] === 0x5a)
-    return parseMz(bytes, fileSize, mzWindowsHeaderSignature);
+    return parseMzExecutableMetadata(
+      bytes,
+      parseMzHeaderEvidence(bytes, fileSize, mzWindowsHeaderSignature),
+    );
   if (bytes.length < 8) return err("truncated or unsupported binary header");
-  const magic = bytes.readUInt32BE(0);
-  if ([0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe].includes(magic))
+  if (readMachoHeaderPrefixFacts(bytes).format !== null)
     return parseThinMachO(bytes, fileSize);
   const fatHeader =
     fatEvidence?.header ?? readFatContainerHeader(bytes, fileSize);
@@ -148,8 +147,7 @@ const parseThinMachO = (
   const table = readMachoLoadCommandTableHeader(bytes, fileSize);
   if (!table.ok) return table;
   if (table.value === null) return err("unsupported binary format");
-  const identity = readMachoHeaderPrefixFacts(bytes.subarray(0, 12)).identity;
-  if (identity === null) return err("unsupported Mach-O architecture");
+  const { identity } = table.value;
   const architecture =
     identity.cpuType === CPU_TYPE_ARM64_32
       ? "arm64_32"
@@ -369,21 +367,11 @@ const fatIdentityError = (
     ReturnType<typeof readMachoHeaderPrefixFacts>
   >,
 ): string | null => {
-  const identity = classifyFatContainerIdentity(header, (offset) => {
-    if (sliceHeadersByOffset?.has(offset))
-      return sliceHeadersByOffset.get(offset)?.magic;
-    const slice = header.slices.find(
-      (candidate) => candidate.offset === offset,
-    );
-    if (slice === undefined || offset >= bytes.length) return undefined;
-    const available = Math.max(
-      0,
-      Math.min(slice.size, bytes.length - offset, 12),
-    );
-    return readMachoHeaderPrefixFacts(
-      bytes.subarray(offset, offset + available),
-    ).magic;
-  });
+  const identity = classifyFatContainerEvidence(
+    header,
+    bytes,
+    sliceHeadersByOffset,
+  );
   if (identity.state === "needs-slice-header")
     return "FAT slice identity is outside the bounded prefix";
   if (identity.state === "not-mach-o") return "unsupported binary format";
@@ -444,12 +432,11 @@ const parseElf = (
   });
 };
 
-const parseMz = (
+/** Select executable metadata from the reader's completed MZ observations. */
+export const parseMzExecutableMetadata = (
   bytes: Buffer,
-  fileSize: number,
-  signatureAtOffset?: MzWindowsHeaderSignatureEvidence,
+  evidence: MzHeaderEvidence,
 ): Result<ExecutableMetadata, string> => {
-  const evidence = parseMzHeaderEvidence(bytes, fileSize, signatureAtOffset);
   const { windowsHeader } = evidence;
   if (
     windowsHeader.state === "header-needed" ||
@@ -630,6 +617,35 @@ export const peRvaToFileOffset = (
   return undefined;
 };
 
+/** CodeView RVA admission uses the same bounded prefix as target file reads. */
+const PE_CODEVIEW_MAPPING_BYTES = 4096;
+
+/** Interpret complete debug entries once; callers own directory and payload read bounds. */
+export function* peCodeViewDataRanges(
+  directory: Buffer,
+  sectionTable: Buffer,
+  numberOfSections: number,
+  sizeOfHeaders: number,
+): Generator<{ readonly fileOffset: number; readonly declaredSize: number }> {
+  for (let offset = 0; offset + 28 <= directory.length; offset += 28) {
+    if (directory.readUInt32LE(offset + 12) !== 2) continue;
+    const declaredSize = directory.readUInt32LE(offset + 16);
+    if (declaredSize < 16) continue;
+    const rawPointer = directory.readUInt32LE(offset + 24);
+    const fileOffset =
+      rawPointer !== 0
+        ? rawPointer
+        : peRvaToFileOffset(
+            directory.readUInt32LE(offset + 20),
+            sectionTable,
+            numberOfSections,
+            sizeOfHeaders,
+            Math.min(declaredSize, PE_CODEVIEW_MAPPING_BYTES),
+          );
+    if (fileOffset !== undefined) yield { fileOffset, declaredSize };
+  }
+}
+
 /** Parse CodeView metadata from a bounded in-memory PE image buffer. */
 export const parsePeCodeViewFromBuffer = (
   fileBytes: Buffer,
@@ -673,29 +689,16 @@ export const parsePeCodeViewFromBuffer = (
     debugDir.debugSize,
     fileBytes.length - debugFileOffset,
   );
-  const numEntries = Math.floor(maxDebugBytes / 28);
-  for (let j = 0; j < numEntries; j++) {
-    const entryOffset = debugFileOffset + j * 28;
-    const type = fileBytes.readUInt32LE(entryOffset + 12);
-    if (type !== 2) continue; // IMAGE_DEBUG_TYPE_CODEVIEW
-    const sizeOfData = fileBytes.readUInt32LE(entryOffset + 16);
-    let pointerToRawData = fileBytes.readUInt32LE(entryOffset + 24);
-    if (pointerToRawData === 0) {
-      const addressOfRawData = fileBytes.readUInt32LE(entryOffset + 20);
-      const mapped = peRvaToFileOffset(
-        addressOfRawData,
-        sectionTable,
-        numberOfSections,
-        debugDir.sizeOfHeaders,
-        Math.min(sizeOfData, 4096),
-      );
-      if (mapped === undefined) continue;
-      pointerToRawData = mapped;
-    }
-    if (
-      sizeOfData < 16 ||
-      fileBytes.length < pointerToRawData + Math.min(sizeOfData, 24)
-    )
+  for (const {
+    fileOffset: pointerToRawData,
+    declaredSize: sizeOfData,
+  } of peCodeViewDataRanges(
+    fileBytes.subarray(debugFileOffset, debugFileOffset + maxDebugBytes),
+    sectionTable,
+    numberOfSections,
+    debugDir.sizeOfHeaders,
+  )) {
+    if (fileBytes.length < pointerToRawData + Math.min(sizeOfData, 24))
       continue;
     const codeViewData = fileBytes.subarray(
       pointerToRawData,
