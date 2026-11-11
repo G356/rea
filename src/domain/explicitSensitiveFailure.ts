@@ -84,6 +84,9 @@ export const redactSensitiveFailure = (
   // Other observation owners already apply their format-aware exclusions.
   if (redacted !== error && error.partialObservation !== undefined)
     redacted.retainPartialObservation(error.partialObservation);
+  if (redacted !== error)
+    for (const secondary of error.secondaryFailures)
+      redacted.retainSecondaryFailure(redactSensitiveFailure(secondary, text));
   return redacted === error ? error : mirrorCleanup(error, redacted, text);
 };
 
@@ -264,11 +267,16 @@ const redactFailure = (
       error.issues.map(issueProjection),
     );
   if (error instanceof AnalysisOutputError)
-    return new AnalysisOutputError(
-      error.operation,
-      text(error.reason),
-      context,
-    );
+    return new AnalysisOutputError(error.operation, text(error.reason), {
+      ...context,
+      ...(error.userMessage === undefined
+        ? {}
+        : { userMessage: text(error.userMessage) }),
+      ...(error.remediationAction === undefined
+        ? {}
+        : { remediationAction: text(error.remediationAction) }),
+      cleanupOnly: error.cleanupOnly,
+    });
   if (error instanceof AnalysisCapabilityUnavailableError)
     return new AnalysisCapabilityUnavailableError(
       error.providerId,
