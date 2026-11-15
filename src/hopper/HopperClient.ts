@@ -65,11 +65,11 @@ import {
   confirmExternalApplicationExit,
   type HopperOwnedResources,
 } from "./HopperCleanup.js";
+import { HOPPER_SHUTDOWN_TIMEOUT_MS } from "./HopperSessionValues.js";
 import {
   parseHopperServerInfo,
-  HOPPER_SHUTDOWN_TIMEOUT_MS,
   type HopperServerInfo,
-} from "./HopperSessionValues.js";
+} from "./HopperReplyContracts.js";
 import { connectHopperSocketOnce } from "./HopperSocketConnection.js";
 import {
   hopperLauncherFailureDiagnostic,
@@ -1055,8 +1055,10 @@ export class HopperClient {
     ) {
       this.#resources.shutdownConfirmed = true;
       return new HopperStartError({
-        userMessage:
-          "macOS denied permission to send Apple Events to Hopper. Allow the application that starts REA under System Settings > Privacy & Security > Automation, then retry opening the target.",
+        launchRejection: {
+          boundary: "apple_events_authorization",
+          reason: "not_authorized",
+        },
         launcherFailure,
       });
     }
