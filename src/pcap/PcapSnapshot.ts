@@ -3,13 +3,14 @@ import { createHash } from "node:crypto";
 import { chmod, open, stat, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
-import { AnalysisCleanupLease } from "../artifacts/AnalysisCleanupLease.js";
+import { AnalysisCleanupLease } from "../resources/index.js";
 import {
   AnalysisAccessDeniedError,
   AnalysisArtifactChangedError,
-  AnalysisCancelledError,
   AnalysisInputError,
   AnalysisResourceConstraintError,
+  cancelledBy,
+  carriedReason,
 } from "../domain/analysisErrorCore.js";
 import { fixedAllowanceOptions } from "../domain/fixedAllowanceRemediation.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
@@ -24,8 +25,9 @@ import { PrivateRuntimeRoot } from "../process/PrivateRuntimeRoot.js";
 import {
   RuntimeControlUnavailableError,
   runtimeControlCapabilityError,
-} from "../process/RuntimeControlUnavailableError.js";
+} from "../domain/runtimeControlUnavailableError.js";
 import { privateWorkspaceFailure } from "../process/privateWorkspaceFailure.js";
+import { errorMessage } from "../kernel/errorMessage.js";
 
 const OPERATION = "inspect_pcap_capture";
 const MAX_CAPTURE_BYTES = 2 * 1024 ** 3;
@@ -92,8 +94,7 @@ export class PcapSnapshot {
       lease.bindCleanupError(cleanup);
       this.completionCleanup.set(handle, lease);
       if (signal?.aborted !== true) throw cleanup;
-      const cancelled = new AnalysisCancelledError(OPERATION, {
-        cause: signal.reason,
+      const cancelled = cancelledBy(OPERATION, signal, {
         cleanup: {
           reason: "Owned snapshot descriptor close could not be confirmed",
           resources: [this.path],
@@ -129,7 +130,7 @@ export class PcapSnapshot {
           {
             path: ["path"],
             reason: "invalid_value",
-            message: `Cannot read selected capture ${path}: ${cause instanceof Error ? cause.message : String(cause)}`,
+            message: `Cannot read selected capture ${path}: ${errorMessage(cause)}`,
           },
         ]);
       }
@@ -164,6 +165,7 @@ export class PcapSnapshot {
           fixedAllowanceOptions(
             "the owned capture snapshot allowance",
             "input",
+            { limit: MAX_CAPTURE_BYTES, unit: "bytes" },
           ),
         );
       const destination = this.own(
@@ -237,9 +239,7 @@ export class PcapSnapshot {
         cause instanceof RegularFileAdmissionFailure ? cause.cause : cause;
       const cancellation = regularFileCancellation(primary);
       if (cancellation !== undefined)
-        throw new AnalysisCancelledError(OPERATION, {
-          cause: cancellation.reason,
-        });
+        throw cancelledBy(OPERATION, carriedReason(cancellation.reason));
       if (cause instanceof AnalysisError) throw cause;
       throw privateWorkspaceFailure("pcap", OPERATION, primary, this.root.path);
     }
@@ -294,9 +294,7 @@ export class PcapSnapshot {
         cause instanceof RegularFileAdmissionFailure ? cause.cause : cause;
       const cancellation = regularFileCancellation(primary);
       if (cancellation !== undefined)
-        throw new AnalysisCancelledError(OPERATION, {
-          cause: cancellation.reason,
-        });
+        throw cancelledBy(OPERATION, carriedReason(cancellation.reason));
       if (cause instanceof AnalysisError) throw cause;
       throw new AnalysisArtifactChangedError(
         OPERATION,

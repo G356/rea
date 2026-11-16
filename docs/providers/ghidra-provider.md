@@ -33,6 +33,11 @@ undefined. Installation `application.properties` has a fixed 1 MiB read allowanc
 with no runtime override. The failure retains that allowance and directs recovery
 at the selected installation metadata.
 
+Xtensa ELF files (`EM_XTENSA = 94`) use the header-selected Ghidra import
+language and report the canonical `xtensa` architecture in CLI/MCP results.
+Processor extensions and calling-convention compatibility remain specific to
+the selected Ghidra language; family recognition alone does not establish them.
+
 Retained process diagnostics can report termination by `SIGKILL`; the signal alone
 cannot establish an OOM kill. REA gives neutral recovery guidance and preserves the
 signal. Confirm resource causes from process output or host/container records;
@@ -230,8 +235,7 @@ status and limitations state.
 
 Relocation rows retain Ghidra's `symbol` value, including an empty string or
 null when returned by Ghidra. It is a provider observation, not proof of the
-runtime-resolved address. Older Evidence may not have recorded this field;
-a relocation page requesting it reports that uncertainty.
+runtime-resolved address. Every relocation row records the field.
 
 For large relocation inventories, select MCP `inspect_native_load_image` with
 `detail: "summary"`. It returns verification state, observed identity and counts,
@@ -313,6 +317,11 @@ client deadline. Transient decompile timeout failures remain uncached so the
 same function can be retried after raising the limit. See the
 [settings design](../design/limits-and-recovery.md) for snapshots, precedence,
 and provider integration.
+
+Every Ghidra analysis profile commits `producer`: the REA release and a SHA-256
+of the packaged bridge scripts. A snapshot replays only under the same
+producer, so after an REA upgrade or a bridge script change an older snapshot is
+refused; open the target without it and save a fresh snapshot.
 
 When `inspect_native_instruction` selects a byte inside a listed instruction,
 `containing_instruction` reports its separate start, length and Ghidra Listing
