@@ -82,12 +82,14 @@ import {
 } from "./GhidraDiagnostics.js";
 import { GhidraLaunchError, type GhidraLaunch } from "./GhidraLauncher.js";
 import { GhidraRequestQueue } from "./GhidraRequestQueue.js";
+import { DEFAULT_GHIDRA_CANCEL_GRACE } from "../config/ghidraCancelGrace.js";
 import {
   bindGhidraSessionFailure,
   GHIDRA_STARTUP_DEADLINE_ELAPSED,
   GhidraSessionError,
 } from "./GhidraSessionError.js";
 import {
+  GHIDRA_MUTATING_OPERATIONS,
   isGhidraShutdownAcknowledgement,
   parseGhidraSessionInfo,
   type GhidraSessionInfo,
@@ -214,6 +216,7 @@ export class GhidraClient {
     | { readonly timeoutMs: number; readonly failure: GhidraSessionError }
     | undefined;
   #closePromise: Promise<void> | undefined;
+  #closeForced = false;
   readonly #failure = bindGhidraSessionFailure(
     (scope) => this.#diagnostics(scope),
     (value, incomplete) => this.#redactAuthentication(value, incomplete),
@@ -322,6 +325,10 @@ export class GhidraClient {
       },
       this.#failure,
       () => this.#stopAfterActiveCancellation(),
+      {
+        interruptible: (method) => !GHIDRA_MUTATING_OPERATIONS.has(method),
+        grace: options.cancelGrace ?? DEFAULT_GHIDRA_CANCEL_GRACE,
+      },
     );
   }
 
@@ -505,6 +512,7 @@ export class GhidraClient {
       readonly progress?: ProgressReporter;
       readonly decompileTimeoutSeconds?: number | null;
       readonly decompileMaxPayloadMiB?: number | null;
+      readonly decompileReadAhead?: readonly string[];
       readonly valueFlowLimits?: NativeValueFlowLimits;
     } = {},
   ): Promise<Result<JsonValue, GhidraSessionError>> {
@@ -548,6 +556,7 @@ export class GhidraClient {
       readonly progress?: ProgressReporter;
       readonly decompileTimeoutSeconds?: number | null;
       readonly decompileMaxPayloadMiB?: number | null;
+      readonly decompileReadAhead?: readonly string[];
       readonly valueFlowLimits?: NativeValueFlowLimits;
     },
   ): Promise<Result<JsonValue, GhidraSessionError>> {
@@ -586,6 +595,9 @@ export class GhidraClient {
         ...(options.decompileMaxPayloadMiB === undefined
           ? {}
           : { decompileMaxPayloadMiB: options.decompileMaxPayloadMiB }),
+        ...(options.decompileReadAhead === undefined
+          ? {}
+          : { decompileReadAhead: options.decompileReadAhead }),
       },
     );
     if (options.progress === undefined) return pending;
@@ -1013,10 +1025,28 @@ export class GhidraClient {
   #requestClose(forceStop: boolean): Promise<void> {
     const starting = this.#startupAttempt;
     starting?.close();
-    this.#closePromise ??= Promise.resolve().then(() =>
-      this.#close(starting, forceStop),
-    );
-    return this.#closePromise;
+    const previous = this.#closePromise;
+    // Join an equal or stronger close. A forced stop requested during a
+    // graceful close interrupts that close's outstanding bridge requests (a
+    // stalled checkpoint or shutdown reply), then runs once it settles.
+    if (previous !== undefined && (!forceStop || this.#closeForced))
+      return previous;
+    if (previous !== undefined)
+      this.#failAll(
+        this.#failure("process", "Ghidra close escalated to a forced stop"),
+      );
+    this.#closeForced = forceStop;
+    const attempt: Promise<void> = (previous ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(() => this.#close(starting, forceStop))
+      .finally(() => {
+        if (this.#closePromise === attempt) {
+          this.#closePromise = undefined;
+          this.#closeForced = false;
+        }
+      });
+    this.#closePromise = attempt;
+    return attempt;
   }
 
   #stopAfterActiveCancellation(): Promise<Result<null, AnalysisError>> {
@@ -1504,7 +1534,6 @@ export class GhidraClient {
     forceStop: boolean,
   ): Promise<void> {
     try {
-      // best-effort cleanup: a rejected startup must not mask close/cleanup.
       await starting?.promise.catch(() => undefined);
       await this.#cleanup(forceStop);
     } finally {
@@ -1513,7 +1542,6 @@ export class GhidraClient {
         (forceStop || this.#socket === undefined || this.#socket.destroyed)
       )
         this.#startupAttempt = undefined;
-      this.#closePromise = undefined;
     }
   }
 
